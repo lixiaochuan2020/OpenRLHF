@@ -37,13 +37,16 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
         # Treat each AgentInstance as an isolated environment; bind every prompt to its own independent instance
         agent_instance = self.agent_instance_cls()
 
+        # Unwrap VL processor to its inner text tokenizer for text-only encode/decode.
+        text_tokenizer = hf_tokenizer.tokenizer if hasattr(hf_tokenizer, "image_processor") else hf_tokenizer
+
         # Initialize with reset function
         initial_states = {"observation": prompt, "label": label}
         reset_result = await agent_instance.reset(initial_states)
         observation_text = reset_result["observation"]
 
         # Tokenize the initial observation
-        current_obs_tokens = hf_tokenizer(observation_text, add_special_tokens=False, return_tensors="pt")[
+        current_obs_tokens = text_tokenizer(observation_text, add_special_tokens=False, return_tensors="pt")[
             "input_ids"
         ][0].tolist()
 
@@ -57,7 +60,7 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
             )
             current_obs_tokens = current_obs_tokens[-max_initial_length:]
             # Also update observation_text to match truncated tokens
-            observation_text = hf_tokenizer.decode(current_obs_tokens, skip_special_tokens=False)
+            observation_text = text_tokenizer.decode(current_obs_tokens, skip_special_tokens=False)
 
         # Initialize tracking variables
         action_ranges = []
@@ -108,7 +111,7 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
             current_obs_tokens = (
                 current_obs_tokens
                 + action_tokens
-                + hf_tokenizer(environment_feedback_text, add_special_tokens=False, return_tensors="pt")["input_ids"][
+                + text_tokenizer(environment_feedback_text, add_special_tokens=False, return_tensors="pt")["input_ids"][
                     0
                 ].tolist()
             )
