@@ -37,25 +37,18 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
         # Treat each AgentInstance as an isolated environment; bind every prompt to its own independent instance
         agent_instance = self.agent_instance_cls()
 
+        # Unwrap VL processor to its inner text tokenizer. This avoid tokenizer error when we use VLM model.
+        text_tokenizer = hf_tokenizer.tokenizer if hasattr(hf_tokenizer, "image_processor") else hf_tokenizer
+
         # Initialize with reset function
         initial_states = {"observation": prompt, "label": label}
         reset_result = await agent_instance.reset(initial_states)
         observation_text = reset_result["observation"]
 
-        # Tokenize the initial observation — for VLM the processor inserts
-        # image placeholder tokens and returns pixel tensors for training.
-        pil_images = []
-        mm_train_inputs = None
-        if images and hasattr(hf_tokenizer, "image_processor"):
-            from openrlhf.utils.vlm_utils import process_prompt_with_images
-
-            current_obs_tokens, mm_train_inputs, pil_images = process_prompt_with_images(
-                hf_tokenizer, observation_text, images
-            )
-        else:
-            current_obs_tokens = hf_tokenizer(text=observation_text, add_special_tokens=False, return_tensors="pt")[
-                "input_ids"
-            ][0].tolist()
+        # Tokenize the initial observation
+        current_obs_tokens = text_tokenizer(observation_text, add_special_tokens=False, return_tensors="pt")[
+            "input_ids"
+        ][0].tolist()
 
         # Truncate initial observation if it's too long to leave room for generation
         min_generation_tokens = sampling_params.max_tokens if hasattr(sampling_params, "max_tokens") else 1
@@ -73,7 +66,7 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
             )
             current_obs_tokens = current_obs_tokens[-max_initial_length:]
             # Also update observation_text to match truncated tokens
-            observation_text = hf_tokenizer.decode(current_obs_tokens, skip_special_tokens=False)
+            observation_text = text_tokenizer.decode(current_obs_tokens, skip_special_tokens=False)
 
         # Initialize tracking variables
         action_ranges = []
@@ -150,7 +143,13 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
 
             # Concatenate observation, action, and environment_feedback
             observation_text = observation_text + action_text + environment_feedback_text
-            current_obs_tokens = current_obs_tokens + action_tokens + feedback_tokens
+            current_obs_tokens = (
+                current_obs_tokens
+                + action_tokens
+                + text_tokenizer(environment_feedback_text, add_special_tokens=False, return_tensors="pt")["input_ids"][
+                    0
+                ].tolist()
+            )
 
             # Calculate rollout log probs
             if sampling_params.logprobs is not None:
@@ -177,6 +176,161 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
             "scores": final_scores,
             "observation_tokens": current_obs_tokens,
             "action_ranges": action_ranges,
+            "rollout_log_probs": rollout_log_probs,
+            "extra_logs": extra_logs,
+        }
+        return final_response
+
+
+class FullTrajectoryAgentExecutor(MultiTurnAgentExecutor):
+    """Multi-turn executor that keeps a full uncompressed trajectory for training.
+
+    When the agent's step() returns ``reset_context_messages``, the *inference*
+    token buffer (``current_obs_tokens``) is rebuilt from the compressed messages
+    so that vLLM generates from a shorter context.  Meanwhile, the *training*
+    buffer (``full_obs_tokens``) always appends and is never compressed.
+
+    ``action_ranges`` are recorded against ``full_obs_tokens`` so they remain
+    valid after compression.  ``action_live`` masks out actions whose assistant
+    messages were discarded — the agent reports these via
+    ``discard_action_indices`` in the step result.
+
+    At episode end, the return dict uses ``full_obs_tokens`` (not
+    ``current_obs_tokens``) and only the live action ranges.
+    """
+
+    async def execute(self, prompt, label, sampling_params, max_length: int, hf_tokenizer, llm_engine, images=None):
+        agent_instance = self.agent_instance_cls()
+
+        text_tokenizer = hf_tokenizer.tokenizer if hasattr(hf_tokenizer, "image_processor") else hf_tokenizer
+
+        # Initialize with reset function
+        initial_states = {
+            "observation": prompt,
+            "label": label,
+            "global_train_step": getattr(self, "global_train_step", 0),
+        }
+        reset_result = await agent_instance.reset(initial_states)
+        observation_text = reset_result["observation"]
+
+        # Tokenize the initial observation
+        current_obs_tokens = text_tokenizer(observation_text, add_special_tokens=False, return_tensors="pt")[
+            "input_ids"
+        ][0].tolist()
+
+        # Truncate initial observation if it's too long to leave room for generation
+        min_generation_tokens = sampling_params.max_tokens if hasattr(sampling_params, "max_tokens") else 1
+        max_initial_length = max_length - min_generation_tokens
+        if len(current_obs_tokens) > max_initial_length:
+            logger.warning(
+                f"Initial observation length ({len(current_obs_tokens)}) exceeds max_initial_length ({max_initial_length}). "
+                f"Truncating to fit within max_length ({max_length})."
+            )
+            current_obs_tokens = current_obs_tokens[-max_initial_length:]
+            observation_text = text_tokenizer.decode(current_obs_tokens, skip_special_tokens=False)
+
+        # Initialize tracking variables
+        action_ranges = []
+        total_reward = 0
+        final_scores = 0
+        extra_logs = {}
+
+        # Shadow copy for full uncompressed training trajectory
+        full_obs_tokens = list(current_obs_tokens)
+        action_live = []
+
+        if sampling_params.logprobs is not None:
+            rollout_log_probs = [0.0] * len(current_obs_tokens)
+        else:
+            rollout_log_probs = None
+
+        # Execute multiple steps of interaction
+        while True:
+            # Next sampling budget (based on inference context, not full)
+            sampling_params.max_tokens = max_length - len(current_obs_tokens)
+            if sampling_params.max_tokens <= 0:
+                break
+
+            # Generate response from current (possibly compressed) context
+            request_output = await llm_engine.generate(current_obs_tokens, deepcopy(sampling_params))
+            action_tokens = request_output.outputs[0].token_ids
+            action_text = request_output.outputs[0].text
+
+            # Record action range in full (uncompressed) token space
+            start_in_full = len(full_obs_tokens)
+            action_ranges.append((start_in_full, start_in_full + len(action_tokens)))
+            action_live.append(True)
+
+            # Call step function to get environment feedback
+            states = {
+                "observation_text": observation_text,
+                "action_text": action_text,
+                "label": label,
+                "sampling_params": sampling_params,
+            }
+            step_result = await agent_instance.step(states)
+
+            total_reward += step_result["rewards"].item()
+            final_scores = step_result.get("scores", total_reward)
+            environment_feedback_text = step_result["environment_feedback"]
+            done = step_result["done"]
+            extra_logs = step_result.get("extra_logs", {})
+
+            # Tokenize environment feedback
+            feedback_tokens = text_tokenizer(
+                environment_feedback_text, add_special_tokens=False, return_tensors="pt"
+            )["input_ids"][0].tolist()
+
+            reset_messages = step_result.get("reset_context_messages")
+            if reset_messages is not None:
+                # ── Inference path: rebuild compressed tokens for vLLM ──
+                observation_text = hf_tokenizer.apply_chat_template(
+                    reset_messages, tokenize=False, add_generation_prompt=True,
+                )
+                current_obs_tokens = hf_tokenizer.apply_chat_template(
+                    reset_messages, tokenize=True, add_generation_prompt=True,
+                    return_tensors="pt",
+                )[0].tolist()
+
+                # ── Training path: keep full trajectory intact ──
+                full_obs_tokens = full_obs_tokens + action_tokens + feedback_tokens
+
+                # ── Mask discarded actions ──
+                discard_indices = step_result.get("discard_action_indices", set())
+                for i in discard_indices:
+                    if i < len(action_live):
+                        action_live[i] = False
+            else:
+                # ── Normal path: append to both ──
+                observation_text = observation_text + action_text + environment_feedback_text
+                current_obs_tokens = current_obs_tokens + action_tokens + feedback_tokens
+                full_obs_tokens = full_obs_tokens + action_tokens + feedback_tokens
+
+            # Calculate rollout log probs (aligned with full_obs_tokens)
+            if sampling_params.logprobs is not None:
+                for i, logprob in enumerate(request_output.outputs[0].logprobs):
+                    rollout_log_probs.append(logprob[action_tokens[i]].logprob)
+                # dummy logprobs for the env feedback tokens
+                rollout_log_probs.extend([0.0] * (len(full_obs_tokens) - len(rollout_log_probs)))
+
+            if step_result.get("sampling_params", None):
+                sampling_params = step_result["sampling_params"]
+
+            if done:
+                break
+
+        # Filter to only live actions for training
+        training_action_ranges = [
+            r for r, live in zip(action_ranges, action_live) if live
+        ]
+
+        final_response = {
+            "prompt": prompt,
+            "label": label,
+            "reward": total_reward,
+            "scores": final_scores,
+            "observation_tokens": full_obs_tokens,
+            "action_ranges": training_action_ranges,
             "rollout_log_probs": rollout_log_probs,
             "extra_logs": extra_logs,
         }

@@ -121,6 +121,10 @@ class LLMRayActor:
             args=(name, dtype, shape, ipc_handles, empty_cache),
         )
 
+    async def set_global_train_step(self, global_train_step: int):
+        """Set the current training step so the executor can pass it to agents."""
+        self.executor.global_train_step = global_train_step
+
     async def reset_prefix_cache(self):
         await self.llm.reset_prefix_cache()
 

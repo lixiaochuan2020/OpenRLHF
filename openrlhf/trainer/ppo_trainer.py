@@ -518,6 +518,8 @@ class PPOTrainer(BasePPOTrainer):
             )
             while True:
                 # Draw one mini-batch of prompts; stop when loader is exhausted.
+                if self.vllm_engines is not None:
+                    batch_vllm_engine_call(self.vllm_engines, "set_global_train_step", global_step)
                 t_gen_start = time.time()
                 rollout_samples, filter_pass_rate, prompts_consumed, is_exhausted = (
                     self.samples_generator.generate_samples(**self.generate_kwargs)
