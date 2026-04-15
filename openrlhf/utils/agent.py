@@ -284,13 +284,12 @@ class FullTrajectoryAgentExecutor(MultiTurnAgentExecutor):
             reset_messages = step_result.get("reset_context_messages")
             if reset_messages is not None:
                 # ── Inference path: rebuild compressed tokens for vLLM ──
-                observation_text = hf_tokenizer.apply_chat_template(
+                observation_text = text_tokenizer.apply_chat_template(
                     reset_messages, tokenize=False, add_generation_prompt=True,
                 )
-                current_obs_tokens = hf_tokenizer.apply_chat_template(
+                current_obs_tokens = text_tokenizer.apply_chat_template(
                     reset_messages, tokenize=True, add_generation_prompt=True,
-                    return_tensors="pt",
-                )[0].tolist()
+                )
 
                 # ── Training path: keep full trajectory intact ──
                 full_obs_tokens = full_obs_tokens + action_tokens + feedback_tokens
