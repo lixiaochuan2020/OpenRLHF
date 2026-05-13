@@ -249,6 +249,19 @@ class FullTrajectoryAgentExecutor(MultiTurnAgentExecutor):
             # Next sampling budget (based on inference context, not full)
             sampling_params.max_tokens = max_length - len(current_obs_tokens)
             if sampling_params.max_tokens <= 0:
+                # Notify the agent so it can compute a final reward (e.g. an
+                # overflow penalty) instead of silently exiting with reward=0.
+                truncate_states = {
+                    "observation_text": observation_text,
+                    "action_text": "",
+                    "label": label,
+                    "sampling_params": sampling_params,
+                    "context_force_truncated": True,
+                }
+                step_result = await agent_instance.step(truncate_states)
+                total_reward += step_result["rewards"].item()
+                final_scores = step_result.get("scores", total_reward)
+                extra_logs = step_result.get("extra_logs", {})
                 break
 
             # Generate response from current (possibly compressed) context
@@ -284,12 +297,19 @@ class FullTrajectoryAgentExecutor(MultiTurnAgentExecutor):
             reset_messages = step_result.get("reset_context_messages")
             if reset_messages is not None:
                 # ── Inference path: rebuild compressed tokens for vLLM ──
+                # Render the template to text first, then tokenize that text.
+                # `apply_chat_template(tokenize=True)` is unreliable across
+                # tokenizer flavors in transformers 5.x: slow tokenizers return
+                # a tokenizers.Encoding object, and the dict-return path yields
+                # BatchEncoding whose iteration produces the *string* keys
+                # 'input_ids' / 'attention_mask'. Both break vLLM's int-only
+                # prompt_token_ids contract. Two-step always returns List[int].
                 observation_text = text_tokenizer.apply_chat_template(
                     reset_messages, tokenize=False, add_generation_prompt=True,
                 )
-                current_obs_tokens = text_tokenizer.apply_chat_template(
-                    reset_messages, tokenize=True, add_generation_prompt=True,
-                )
+                current_obs_tokens = text_tokenizer(
+                    observation_text, add_special_tokens=False, return_tensors="pt",
+                )["input_ids"][0].tolist()
 
                 # ── Training path: keep full trajectory intact ──
                 full_obs_tokens = full_obs_tokens + action_tokens + feedback_tokens
